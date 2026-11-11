@@ -1,3 +1,4 @@
 @echo off
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0stop-worker.ps1"
+if not exist "%~dp0dist\FolioImageWorker\FolioImageWorker.exe" exit /b 1
+"%~dp0dist\FolioImageWorker\FolioImageWorker.exe" --stop
 if errorlevel 1 pause

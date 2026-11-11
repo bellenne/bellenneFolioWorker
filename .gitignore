@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+.venv-build/
+build/
+dist/
+FolioImageWorker.spec
 data/
 spool/
 prints/

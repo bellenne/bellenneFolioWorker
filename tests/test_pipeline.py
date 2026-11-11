@@ -87,6 +87,7 @@ class PipelineTest(unittest.TestCase):
             ("seedream-5-0-flash", "2K"),
             ("seedream-4.5", "4K"),
             ("hy-image-v3.5-preview", "4K"),
+            ("flux-3-image-klein", "4K"),
         ]
         for model, resolution in selected:
             with self.subTest(model=model), tempfile.TemporaryDirectory() as root:
@@ -264,9 +265,30 @@ class PipelineTest(unittest.TestCase):
              patch.object(module, "AITUNNEL_BASE_URL", "https://example.invalid/v1"):
             self.assertIn("official AI Tunnel", module.provider_error())
 
+    def test_skipped_generation_prints_the_photo_without_a_paid_request(self):
+        from folio_worker import app as module
+        with tempfile.TemporaryDirectory() as root:
+            folder = Path(root) / "job"
+            folder.mkdir()
+            Image.new("RGB", (2000, 4000), "blue").save(folder / "input.png")
+            row = {"id": "job", "status": "queued", "provider": "aitunnel", "folio_job_id": 12, "skip_generation": 1,
+                   "width_cm": 40, "height_cm": 60, "pixel_width": 2362, "pixel_height": 3543,
+                   "offer_id": "", "order_number": ""}
+            changes = []
+            refuse = AssertionError("a provider was called")
+            with patch.object(module, "DATA", Path(root)), patch.object(module, "get_job", return_value=row),                  patch.object(module, "update", side_effect=lambda _job_id, **fields: changes.append(fields)),                  patch.object(module, "aitunnel_result", side_effect=refuse),                  patch.object(module, "nano_result", side_effect=refuse):
+                module.process(row)
+            self.assertEqual([change["status"] for change in changes], ["composing", "completed"], changes)
+            self.assertTrue(changes[-1]["print_file"].endswith("print.jpg"))
+            with Image.open(folder / "print.jpg") as printed:
+                self.assertEqual(printed.size, (3071, 4252))
+                self.assertEqual(round(printed.info["dpi"][0]), 150)
+            with Image.open(folder / "preview.jpg") as preview:
+                self.assertEqual(max(preview.size), 1000)
+
     def test_uncertain_generation_pauses_worker_job(self):
         from folio_worker import app as module
-        row = {"id": "job", "status": "queued", "provider": "aitunnel", "folio_job_id": 12}
+        row = {"id": "job", "status": "queued", "provider": "aitunnel", "folio_job_id": 12, "skip_generation": 0}
         changes = []
         with patch.object(module, "get_job", return_value=row), \
              patch.object(module, "update", side_effect=lambda _job_id, **fields: changes.append(fields)), \
@@ -330,47 +352,114 @@ class PipelineTest(unittest.TestCase):
             Image.new("RGB", (400, 600), "blue").save(source)
             row = {"id": "job", "width_cm": 40, "height_cm": 60,
                    "pixel_width": module.image_pixels(40),
-                   "pixel_height": module.image_pixels(60)}
+                   "pixel_height": module.image_pixels(60),
+                   "offer_id": "", "order_number": ""}
             with patch.object(module, "DATA", data):
                 output = module.compose(row, source)
             with Image.open(output) as printed:
                 self.assertEqual(printed.size, (module.image_pixels(52), module.image_pixels(72)))
                 self.assertEqual(tuple(round(value) for value in printed.info["dpi"]), (150, 150))
                 self.assertEqual(printed.getpixel((0, 0)), (255, 255, 255))
-                self.assertEqual(printed.getpixel((printed.width // 2, printed.height // 2)), (0, 0, 255))
+                self.assertGreaterEqual(printed.getpixel((printed.width // 2, printed.height // 2))[2], 250)
                 white_left = (printed.width - module.image_pixels(45)) // 2
                 white_top = (printed.height - module.image_pixels(65)) // 2
-                self.assertEqual(printed.getpixel((white_left - 1, printed.height // 2)), (255, 255, 255))
-                self.assertEqual(printed.getpixel((white_left, printed.height // 2)), (0, 0, 255))
-                self.assertEqual(printed.getpixel((printed.width // 2, white_top - 1)), (255, 255, 255))
-                self.assertEqual(printed.getpixel((printed.width // 2, white_top)), (0, 0, 255))
+                self.assertTrue(all(value >= 250 for value in printed.getpixel((white_left - 1, printed.height // 2))))
+                self.assertGreaterEqual(printed.getpixel((white_left, printed.height // 2))[2], 250)
+                self.assertTrue(all(value >= 250 for value in printed.getpixel((printed.width // 2, white_top - 1))))
+                self.assertGreaterEqual(printed.getpixel((printed.width // 2, white_top))[2], 250)
             with Image.open(folder / "preview.jpg") as preview:
                 self.assertEqual(max(preview.size), 1000)
                 self.assertEqual(preview.size, (667, 1000))
 
-    def test_topaz_only_when_long_side_is_short_by_3000_pixels(self):
+    def compose_labeled(self, root, offer_id, order_number, width_cm=40, height_cm=60):
         from folio_worker import app as module
-        self.assertFalse(module.needs_topaz((4096, 2731), (5906, 5906)))
-        self.assertFalse(module.needs_topaz((1000, 1000), (3999, 1000)))
-        self.assertTrue(module.needs_topaz((1000, 1000), (4000, 1000)))
+        data = Path(root) / "data"
+        (data / "job").mkdir(parents=True, exist_ok=True)
+        source = Path(root) / "source.png"
+        Image.new("RGB", (400, 600), "blue").save(source)
+        row = {"id": "job", "width_cm": width_cm, "height_cm": height_cm,
+               "pixel_width": module.image_pixels(width_cm),
+               "pixel_height": module.image_pixels(height_cm),
+               "offer_id": offer_id, "order_number": order_number}
+        with patch.object(module, "DATA", data):
+            output = module.compose(row, source)
+        with Image.open(output) as printed:
+            printed.load()
+            return printed.copy(), data
 
+    @staticmethod
+    def ink(sheet, top, bottom):
+        """Bounding box of dark pixels in a horizontal band, in sheet coordinates."""
+        band = sheet.convert("L").crop((0, top, sheet.width, bottom)).point(lambda v: 255 if v < 128 else 0)
+        box = band.getbbox()
+        return box and (box[0], box[1] + top, box[2], box[3] + top)
+
+    def test_print_has_article_on_top_and_order_number_on_bottom(self):
+        from folio_worker import app as module
+        margin = module.image_pixels(0.5)
+        band = module.image_pixels(3)
         with tempfile.TemporaryDirectory() as root:
-            root = Path(root)
-            source = root / "generated.png"
-            Image.new("RGB", (1000, 1000), "blue").save(source)
-            spool = root / "spool"
-            output = spool / "upscale" / "upscaled.png"
-            output.parent.mkdir(parents=True)
-            Image.new("RGB", (4000, 1000), "blue").save(output)
-            with patch.object(module, "SPOOL", spool), patch.object(module, "update", lambda *_args, **_kwargs: None), \
-                 patch.object(module, "STOP", threading.Event()):
-                self.assertEqual(module.topaz_result({"id": "skip", "pixel_width": 3999,
-                                                       "pixel_height": 1000}, source), source)
-                self.assertFalse((spool / "skip").exists())
-                self.assertEqual(module.topaz_result({"id": "upscale", "pixel_width": 4000,
-                                                       "pixel_height": 1000}, source), output)
-                request = json.loads((spool / "upscale" / "request.json").read_text())
-                self.assertEqual(request["scale"], 4)
+            printed, data = self.compose_labeled(root, "ТЕСТ-40x60", "12345678-0001")
+            top = self.ink(printed, 0, band)
+            low = self.ink(printed, printed.height - band, printed.height)
+            self.assertIsNotNone(top)
+            self.assertIsNotNone(low)
+            self.assertAlmostEqual(top[1], margin, delta=2)
+            self.assertAlmostEqual(printed.height - low[3], margin, delta=2)
+            # Small, centred and entirely inside the white band.
+            self.assertLess(top[3], margin + module.image_pixels(0.6))
+            self.assertAlmostEqual((top[0] + top[2]) / 2, printed.width / 2, delta=4)
+            self.assertAlmostEqual((low[0] + low[2]) / 2, printed.width / 2, delta=4)
+            # The buyer's preview stays clean.
+            with Image.open(data / "job" / "preview.jpg") as preview:
+                self.assertGreater(preview.convert("RGB").split()[2].getextrema()[0], 200)
+
+    def test_labels_differ_by_field(self):
+        with tempfile.TemporaryDirectory() as root:
+            article, _ = self.compose_labeled(root, "AAA", "")
+            order, _ = self.compose_labeled(root, "", "111")
+            band = article.height // 25
+            self.assertIsNotNone(self.ink(article, 0, band))
+            self.assertIsNone(self.ink(article, article.height - band, article.height))
+            self.assertIsNone(self.ink(order, 0, band))
+            self.assertIsNotNone(self.ink(order, order.height - band, order.height))
+
+    def test_no_label_data_leaves_white_bands_clean(self):
+        with tempfile.TemporaryDirectory() as root:
+            printed, _ = self.compose_labeled(root, "", "")
+            band = printed.height // 25
+            self.assertIsNone(self.ink(printed, 0, band))
+            self.assertIsNone(self.ink(printed, printed.height - band, printed.height))
+
+    def test_long_article_shrinks_and_stays_on_the_sheet(self):
+        from folio_worker import app as module
+        margin = module.image_pixels(0.5)
+        with tempfile.TemporaryDirectory() as root:
+            printed, _ = self.compose_labeled(root, "ДЛИННЫЙ-АРТИКУЛ-" * 12, "1", width_cm=4, height_cm=4)
+            top = self.ink(printed, 0, printed.height // 6)
+            self.assertIsNotNone(top)
+            self.assertGreaterEqual(top[0], margin - 1)
+            self.assertLessEqual(top[2], printed.width - margin + 1)
+
+    def test_label_text_is_one_printable_line(self):
+        from folio_worker import app as module
+        self.assertEqual(module.label_text("  А\n\tБ\x00В  "), "А Б В")
+        self.assertEqual(module.label_text(None), "")
+        self.assertEqual(module.label_text(123), "")
+        self.assertEqual(len(module.label_text("я" * 300)), 255)
+
+    def test_missing_font_is_a_visible_failure(self):
+        from folio_worker import app as module
+        with patch.object(module, "LABEL_FONTS", ("Z:/missing.ttf",)), \
+             self.assertRaisesRegex(RuntimeError, "шрифт"):
+            module.draw_print_label(Image.new("RGB", (400, 100), "white"), "Артикул: 1", bottom=False)
+
+    def test_print_names_are_validated_before_placement(self):
+        from folio_worker import app as module
+        self.assertEqual(module.safe_print_name("art-1.png"), "art-1.png")
+        for name in ("../art.jpg", r"folder\art.jpg", "CON.jpg", "art.pdf", "art.jpg "):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                module.safe_print_name(name)
 
     def test_nano_retries_connection_failures_without_repeating_ambiguous_post(self):
         from folio_worker import app as module
@@ -417,7 +506,8 @@ class PipelineTest(unittest.TestCase):
                 with TestClient(module.app):
                     worker_id = str(uuid.uuid4())
                     job = {"id": 23, "worker_id": worker_id, "prompt": "Новый фон",
-                           "width_cm": 4, "height_cm": 4,
+                           "width_cm": 4, "height_cm": 4, "skip_generation": True,
+                           "offer_id": "ТЕСТ-1", "order_number": "12345678-0001",
                            "image_urls": ["https://one.example.ru/folio/image-worker/input/token/0"]}
                     image = io.BytesIO()
                     Image.new("RGB", (300, 300), "blue").save(image, "PNG")
@@ -435,7 +525,10 @@ class PipelineTest(unittest.TestCase):
                         def stream(self, *_): return FakeResponse()
 
                     def fetch(url, **kwargs):
-                        self.assertEqual(kwargs["headers"], {"Authorization": "Bearer pull-key", "X-Folio-Image-Models": "1", "X-Folio-Prompt-Planner": "1", "X-Folio-Image-Provider": "mock"})
+                        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer pull-key")
+                        self.assertEqual(kwargs["headers"]["X-Folio-Image-Provider"], "mock")
+                        uuid.UUID(kwargs["headers"]["X-Folio-Worker-Id"])
+                        uuid.UUID(kwargs["headers"]["X-Folio-Session-Id"])
                         return httpx.Response(200, json=job, request=httpx.Request("GET", url))
 
                     with patch.object(module.httpx, "get", fetch), patch.object(module.httpx, "Client", FakeClient):
@@ -443,9 +536,12 @@ class PipelineTest(unittest.TestCase):
                         self.assertFalse(module.pull_one())
                     self.assertEqual(module.get_job(worker_id)["folio_job_id"], 23)
                     self.assertEqual(module.get_job(worker_id)["provider"], "mock")
+                    self.assertEqual(module.get_job(worker_id)["skip_generation"], 1)
+                    self.assertEqual(module.get_job(worker_id)["offer_id"], "ТЕСТ-1")
+                    self.assertEqual(module.get_job(worker_id)["order_number"], "12345678-0001")
                     self.assertTrue((root / "data" / worker_id / "input.png").exists())
                     Image.new("RGB", (1000, 667), "blue").save(root / "data" / worker_id / "preview.jpg", "JPEG")
-                    module.update(worker_id, status="completed", print_file="local.tif")
+                    module.update(worker_id, status="completed", print_file="local.jpg")
                     sent = []
 
                     def upload(url, **kwargs):
@@ -475,7 +571,7 @@ class PipelineTest(unittest.TestCase):
                                     "report_blocked_status TEXT,report_error TEXT)")
                         con.execute("INSERT INTO jobs(id,folio_job_id,status,created_at) VALUES('stale',16,'unknown','1')")
                         con.execute("INSERT INTO jobs(id,folio_job_id,status,created_at,print_file) "
-                                    "VALUES('ready',17,'completed','2','print.tif')")
+                                    "VALUES('ready',17,'completed','2','print.jpg')")
                     sent = []
                     def upload(url, **kwargs):
                         sent.append(kwargs["data"]["worker_id"])
@@ -500,7 +596,7 @@ class PipelineTest(unittest.TestCase):
             os.environ.update({
                 "DATA_DIR": str(Path(root) / "data"),
                 "SPOOL_DIR": str(Path(root) / "spool"),
-                "PRINT_SHARE_PATH": r"\\server\prints",
+                "PRINT_SHARE_PATH": str(Path(root) / "share"),
                 "WORKER_API_KEY": "test-key",
                 "PUBLIC_BASE_URL": "https://worker.example.com",
                 "FOLIO_PUBLIC_BASE_URL": "https://one.example.ru",
@@ -508,6 +604,8 @@ class PipelineTest(unittest.TestCase):
             })
             from folio_worker import app as module
             module = importlib.reload(module)
+            share = Path(root) / "share"
+            share.mkdir()
 
             self.assertTrue(module.NANO_CALLBACK_URL.startswith(
                 "https://one.example.ru/folio/image-worker/vendor-callback/"))
@@ -522,40 +620,32 @@ class PipelineTest(unittest.TestCase):
                     files={"image": ("test.png", payload.getvalue(), "image/png")})
                 self.assertEqual(response.status_code, 202, response.text)
                 job_id = response.json()["id"]
-                folder = Path(root) / "spool" / job_id
                 deadline = time.monotonic() + 15
-                while not (folder / "print_request.json").exists() and time.monotonic() < deadline:
+                work_files = Path(root) / "data" / job_id
+                while not (work_files / "print.jpg").exists() and time.monotonic() < deadline:
                     time.sleep(.1)
-                self.assertTrue((folder / "print_request.json").exists())
-                self.assertFalse((folder / "request.json").exists())
-                from topaz_agent import upload_print
-                share = Path(root) / "share"
-                share.mkdir()
-                upload_print(folder, share)
+                self.assertTrue((work_files / "print.jpg").exists())
                 while time.monotonic() < deadline:
                     status = client.get(f"/v1/jobs/{job_id}", headers={"Authorization": "Bearer test-key"}).json()
                     if status["status"] in ("completed", "failed"):
                         break
                     time.sleep(.1)
                 self.assertEqual(status["status"], "completed", status)
-                self.assertEqual(status["print_file"], str(share / f"{job_id}.tif"))
-                with Image.open(share / f"{job_id}.tif") as print_image:
+                self.assertEqual(status["print_file"], str((work_files / "print.jpg").resolve()))
+                self.assertEqual((work_files / "source-1.png").read_bytes(), payload.getvalue())
+                self.assertTrue((work_files / "generated.png").is_file())
+                self.assertTrue((work_files / "preview.jpg").is_file())
+                self.assertFalse(list(share.iterdir()))
+                with Image.open(work_files / "print.jpg") as print_image:
                     # 4 cm canvas + 2×(2.5 cm mirror + 3.5 cm white) = 16 cm.
                     self.assertEqual(print_image.size, (945, 945))
                     self.assertEqual(tuple(round(x) for x in print_image.info["dpi"]), (150, 150))
                     self.assertEqual(print_image.getpixel((0, 0)), (255, 255, 255))
-                    self.assertEqual(print_image.getpixel((472, 472)), (0, 0, 255))
+                    self.assertGreaterEqual(print_image.getpixel((472, 472))[2], 250)
                 preview = client.get(f"/v1/jobs/{job_id}/preview", headers={"Authorization": "Bearer test-key"})
                 self.assertEqual(preview.status_code, 200)
                 with Image.open(io.BytesIO(preview.content)) as preview_image:
                     self.assertEqual(max(preview_image.size), 1000)
-
-                local = Path(root) / "local" / job_id
-                local.mkdir(parents=True)
-                (local / "print_request.json").write_text(json.dumps({"job_id": job_id}))
-                (local / "print.tif").write_bytes((share / f"{job_id}.tif").read_bytes())
-                upload_print(local, None)
-                self.assertEqual((local / "print_uploaded.ok").read_text(), str((local / "print.tif").resolve()))
 
                 class FakeResponse:
                     def __enter__(self): return self

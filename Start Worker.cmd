@@ -1,3 +1,8 @@
 @echo off
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start-worker.ps1"
+if not exist "%~dp0dist\FolioImageWorker\FolioImageWorker.exe" (
+  echo Сначала запустите Build Windows.cmd
+  pause
+  exit /b 1
+)
+start "" "%~dp0dist\FolioImageWorker\FolioImageWorker.exe"
 if errorlevel 1 pause
