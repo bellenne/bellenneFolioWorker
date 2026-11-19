@@ -14,7 +14,7 @@ Push-Location $project
 try {
     & $python -m PyInstaller --noconfirm --clean --onedir --windowed `
         --name FolioImageWorker --collect-submodules uvicorn `
-        --hidden-import folio_worker.app `
+        --hidden-import folio_worker.app --hidden-import folio_worker.screenshot `
         folio_desktop.py
     if ($LASTEXITCODE -ne 0) { throw 'Сборка FolioImageWorker.exe завершилась с ошибкой.' }
     $result = Join-Path $project 'dist\FolioImageWorker\FolioImageWorker.exe'
