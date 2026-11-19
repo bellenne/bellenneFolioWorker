@@ -26,7 +26,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
-from folio_worker import __version__
+from folio_worker import __version__, screenshot
 
 DATA = Path(os.getenv("DATA_DIR", "data"))
 SPOOL = Path(os.getenv("SPOOL_DIR", "spool"))
@@ -377,6 +377,10 @@ async def lifespan(_app: FastAPI):
         con.execute("""CREATE TABLE IF NOT EXISTS placement_reports (
             operation_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, payload TEXT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0, next_at TEXT, blocked INTEGER NOT NULL DEFAULT 0)""")
+        con.execute("""CREATE TABLE IF NOT EXISTS placement_proofs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL, serial INTEGER NOT NULL,
+            job_id TEXT NOT NULL, filename TEXT NOT NULL, path TEXT, error TEXT, taken_at TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0, next_at TEXT)""")
         con.execute("""CREATE TABLE IF NOT EXISTS placement_binding (
             job_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL,
             layout_version TEXT NOT NULL, source_sha256 TEXT NOT NULL)""")
@@ -658,7 +662,7 @@ def report_loop():
     failures = 0
     while not STOP.is_set():
         try:
-            delivered = placement_report_one() or report_one()
+            delivered = placement_report_one() or proof_report_one() or report_one()
             failures = 0
             STOP.wait(2 if delivered else 3)
         except Exception as exc:
@@ -826,6 +830,7 @@ def place_one(row: sqlite3.Row, action: dict, item: dict) -> dict:
             con.execute("UPDATE placement_manifest SET state='completed' WHERE operation_id=? AND serial=?",
                         (action["operation_id"], serial))
         result.update(status="completed", saved_path=str(destination), size_bytes=size, sha256=digest)
+        result["screenshot"] = take_placement_proof(row, action, serial, destination, size, digest)
         log_event("print placed", job_id=row["id"], operation=action["operation_id"],
                   serial=serial, filename=filename, bytes=size)
     except PlacementLeaseLost:
@@ -835,6 +840,80 @@ def place_one(row: sqlite3.Row, action: dict, item: dict) -> dict:
         log_event("print placement failed", job_id=row["id"], operation=action["operation_id"],
                   serial=serial, filename=filename, reason=network_error(exc))
     return result
+
+
+def take_placement_proof(row: sqlite3.Row, action: dict, serial: int, destination: Path,
+                         size: int, digest: str) -> str:
+    """Скриншот папки печати с выделенным файлом → очередь отправки в Folio. Ошибка не мешает размещению."""
+    if not screenshot.enabled():
+        return "disabled"
+    taken = datetime.now().astimezone()
+    out = DATA / row["id"] / "placement" / action["operation_id"] / f"{serial}.proof.{uuid.uuid4().hex[:8]}.jpg"
+    caption = [
+        f"Файл в папке печати · {taken:%d.%m.%Y %H:%M:%S} · {destination.name}",
+        f"{destination}",
+        f"{size:,} байт · sha256 {digest}".replace(",", " "),
+        f"Заказ {action.get('posting_number') or row['order_number'] or '—'} · MES {action.get('external_order_id') or '—'} · serial {serial} · "
+        f"операция {action['operation_id']} · воркер {installation_id()}",
+    ]
+    path, error = None, None
+    try:
+        path = str(screenshot.capture_folder(destination, out, caption))
+        log_event("placement screenshot taken", job_id=row["id"], operation=action["operation_id"], serial=serial)
+    except Exception as exc:  # снимок — подтверждение, а не условие размещения
+        error = network_error(exc)[:1000]
+        log_event("placement screenshot failed", job_id=row["id"], operation=action["operation_id"],
+                  serial=serial, reason=error)
+    with connection() as con:
+        con.execute("INSERT INTO placement_proofs(operation_id,serial,job_id,filename,path,error,taken_at) "
+                    "VALUES(?,?,?,?,?,?,?)", (action["operation_id"], serial, row["id"], destination.name,
+                                             path, error, taken.isoformat()))
+    return "ok" if path else "failed"
+
+
+def proof_report_one() -> bool:
+    """Отправляет в Folio один скриншот размещения (или сообщение, что снимок не удался)."""
+    with connection() as con:
+        proof = con.execute("SELECT * FROM placement_proofs WHERE next_at IS NULL OR next_at<=? "
+                            "ORDER BY id LIMIT 1", (now(),)).fetchone()
+    if proof is None:
+        return False
+    job = get_job(proof["job_id"])
+    files = None
+    try:
+        if job is None or job["folio_job_id"] is None:
+            raise LookupError("Задание размещения не найдено")
+        if proof["path"]:
+            files = {"screenshot": ("screenshot.jpg", Path(proof["path"]).read_bytes(), "image/jpeg")}
+        response = httpx.post(f"{FOLIO_BASE}/folio/image-worker/jobs/{job['folio_job_id']}/placement-proof",
+                              headers=folio_headers(), files=files, timeout=60, follow_redirects=False,
+                              data={"operation_id": proof["operation_id"], "serial": str(proof["serial"]),
+                                    "filename": proof["filename"], "taken_at": proof["taken_at"],
+                                    "error": proof["error"] or ""})
+        response.raise_for_status()
+    except Exception as exc:
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+        if status in {404, 409, 422} or isinstance(exc, (LookupError, FileNotFoundError)):
+            with connection() as con:
+                con.execute("DELETE FROM placement_proofs WHERE id=?", (proof["id"],))
+            log_event("placement screenshot rejected", job_id=proof["job_id"], operation=proof["operation_id"],
+                      serial=proof["serial"], reason=network_error(exc))
+        else:
+            attempts = proof["attempts"] + 1
+            due = (datetime.now(timezone.utc) + timedelta(seconds=retry_delay(attempts))).isoformat()
+            with connection() as con:
+                con.execute("UPDATE placement_proofs SET attempts=?,next_at=? WHERE id=?",
+                            (attempts, due, proof["id"]))
+            log_event("placement screenshot retry", job_id=proof["job_id"], operation=proof["operation_id"],
+                      attempt=attempts, reason=network_error(exc))
+        return True
+    with connection() as con:
+        con.execute("DELETE FROM placement_proofs WHERE id=?", (proof["id"],))
+    if proof["path"]:
+        Path(proof["path"]).unlink(missing_ok=True)
+    log_event("placement screenshot delivered", job_id=proof["job_id"], operation=proof["operation_id"],
+              serial=proof["serial"])
+    return True
 
 
 def process_placement(action: dict) -> None:

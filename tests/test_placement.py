@@ -28,6 +28,7 @@ class PlacementTest(unittest.TestCase):
             "FOLIO_POLL_URL": "https://one.example.ru/folio/image-worker/next",
             "IMAGE_PROVIDER": "mock",
             "NANOBANANA_MODE": "mock",
+            "PLACEMENT_SCREENSHOT": "0",
         }
         self.env = patch.dict(os.environ, values)
         self.env.start()
